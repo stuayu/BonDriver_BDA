@@ -18,6 +18,7 @@ private:
 	size_t PacketSize;										// TSパケットサイズ
 	std::vector<BYTE> readBuf;								// 前回処理したTSパケットバッファ(未処理半端分保存用)およびRead用
 	std::vector<BYTE> tempBuf;								// Write用テンポラリバッファ
+	std::vector<BYTE> tlvBuf;								// TLVパケットを保持するためのテンポラリバッファ
 	struct {
 		BYTE continuity_counter;							// 連続性指標
 		BYTE version_number;								// 変更指示
@@ -28,9 +29,15 @@ private:
 			WORD stream_id;									// ストリーム識別／相対ストリーム番号対応情報
 			WORD original_network_id;						// オリジナルネットワ－ク識別／相対ストリーム番号対応情報
 			BYTE receive_status;							// 受信状態
+			BYTE stream_type;
 		} stream_info[15];									// 相対ストリーム番号毎の情報
 		BYTE emergency_indicator;							// 緊急警報指示
 		BYTE relative_stream_number[52];					// 相対ストリーム番号対スロット対応情報
+		BYTE group_id;
+		BYTE number_of_carriers;
+		BYTE carrier_sequence;
+		BYTE number_of_frames;
+		BYTE frame_position;
 	} TSMFData;												// TSMF多重フレームヘッダ情報
 
 public:
@@ -53,5 +60,5 @@ private:
 	// TSMFヘッダの解析を行う
 	BOOL ParseTSMFHeader(const BYTE * buf, size_t len);
 	// 1パケット(1フレーム)の処理を行う
-	BOOL ParseOnePacket(const BYTE * buf, size_t len, WORD onid, WORD tsid, BOOL relative);
+	BOOL ParseOnePacket(const BYTE * buf, size_t len, WORD onid, WORD tsid, BOOL relative, size_t * tlv_headersize, size_t * tlv_start);
 };

@@ -52,6 +52,9 @@ void CTSMFParser::ParseTsBuffer(BYTE * buf, size_t len, BYTE ** newBuf, size_t *
 
 		// 未処理TSパケットバッファをクリア
 		readBuf.clear();
+
+		// TLVパケットバッファをクリア
+		tlvBuf.clear();
 	}
 
 	// 前回の残りデータと新規データを結合して新しいReadバッファを作成
@@ -75,12 +78,34 @@ void CTSMFParser::ParseTsBuffer(BYTE * buf, size_t len, BYTE ** newBuf, size_t *
 
 			continue;
 		}
+
+		size_t tlv_headersize = 0;
+		size_t tlv_start = 0;
 		// 同期できている
-		if (ParseOnePacket(readBuf.data() + readBufPos, readBuf.size() - readBufPos, onid, tsid, relative)) {
+		if (ParseOnePacket(readBuf.data() + readBufPos, readBuf.size() - readBufPos, onid, tsid, relative, &tlv_headersize, &tlv_start)) {
 			WORD pid = ((readBuf[readBufPos + 1] << 8) | readBuf[readBufPos + 2]) & 0x1fff;
-			if (!deleteNullPackets || pid != 0x1fff)
+			if (!deleteNullPackets || pid != 0x1fff) {
 				// 必要なTSMFフレームをテンポラリバッファへ追加
-				tempBuf.insert(tempBuf.end(), readBuf.begin() + readBufPos, readBuf.begin() + readBufPos + 188);
+				if (tlv_headersize == 0) {
+					// 通常のTSパケット
+					tempBuf.insert(tempBuf.end(), readBuf.begin() + readBufPos, readBuf.begin() + readBufPos + PacketSize);
+				}
+				else if (tlv_start == 0) {
+					// 先頭を含まない分割TLVパケットは前回分のバッファーと結合する
+					if (!tlvBuf.empty())
+						tlvBuf.insert(tlvBuf.end(), readBuf.begin() + readBufPos + tlv_headersize, readBuf.begin() + readBufPos + PacketSize);
+				}
+				else {
+					// 先頭を含む分割TLVパケットの場合前回分のバッファーをtempBufに書き込んで新たな分割TLVバッファーを作成
+					// 分割された状態のTLVパケットがtempBufに貯まらないようにしている
+					if (!tlvBuf.empty()) {
+						tlvBuf.insert(tlvBuf.end(), readBuf.begin() + readBufPos + tlv_headersize, readBuf.begin() + readBufPos + tlv_start);
+						tempBuf.insert(tempBuf.end(), tlvBuf.begin(), tlvBuf.end());
+						tlvBuf.clear();
+					}
+					tlvBuf.insert(tlvBuf.end(), readBuf.begin() + readBufPos + tlv_start, readBuf.begin() + readBufPos + PacketSize);
+				}
+			}
 		}
 		// 次のRead位置へ
 		readBufPos += PacketSize;
@@ -164,7 +189,7 @@ BOOL CTSMFParser::ParseTSMFHeader(const BYTE * buf, size_t len)
 
 	// 多重フレーム形式
 	TSMFData.frame_type = (buf[6] & 0x0f);
-	if (TSMFData.frame_type != 0x1)
+	if (TSMFData.frame_type != 0x1 && TSMFData.frame_type != 0x2)
 		return FALSE;
 
 	// 相対ストリーム番号毎の情報
@@ -177,6 +202,8 @@ BOOL CTSMFParser::ParseTSMFHeader(const BYTE * buf, size_t len)
 		TSMFData.stream_info[i].original_network_id = (buf[11 + (i * 4)] << 8) | buf[12 + (i * 4)];
 		// 受信状態
 		TSMFData.stream_info[i].receive_status = (buf[69 + (i / 4)] & (0xc0 >> ((i % 4) * 2))) >> ((3 - (i % 4)) * 2);
+		// ストリーム種別（拡張情報）
+		TSMFData.stream_info[i].stream_type = (buf[125 + (i / 8)] & (0x80 >> (i % 8))) >> (7 - (i % 8));
 	}
 
 	// 緊急警報指示
@@ -187,11 +214,34 @@ BOOL CTSMFParser::ParseTSMFHeader(const BYTE * buf, size_t len)
 		TSMFData.relative_stream_number[i] = (buf[73 + (i / 2)] & (0xf0 >> ((i % 2) * 4))) >> ((1 - (i % 2)) * 4);
 	}
 
+	// 搬送波群の識別
+	TSMFData.group_id = buf[127];
+
+	// 搬送波の総数
+	TSMFData.number_of_carriers = buf[128];
+
+	// 搬送波の順序
+	TSMFData.carrier_sequence = buf[129];
+
+	// フレーム数
+	TSMFData.number_of_frames = (buf[130] & 0xf0) >> 4;
+
+	// フレーム位置情報
+	TSMFData.frame_position = buf[130] & 0x0f;
+
 	return TRUE;
 }
 
-BOOL CTSMFParser::ParseOnePacket(const BYTE * buf, size_t len, WORD onid, WORD tsid, BOOL relative)
+/// <param name="tlv_headersize">分割TLVパケットの0x47を含めた先頭のヘッダーのサイズ</param>
+/// <param name="tlv_start">**ヘッダーを含んだ**分割TLVパケットの先頭位置（先頭を含まないなら0）</param>
+BOOL CTSMFParser::ParseOnePacket(const BYTE * buf, size_t len, WORD onid, WORD tsid, BOOL relative, size_t * tlv_headersize, size_t * tlv_start)
 {
+	if (!tlv_headersize || !tlv_start)
+		return FALSE;
+
+	*tlv_headersize = 0;
+	*tlv_start = 0;
+
 	if (buf[0] != TS_PACKET_SYNC_BYTE) {
 		// TSパケットの同期外れ
 		PacketSize = 0;
@@ -241,6 +291,25 @@ BOOL CTSMFParser::ParseOnePacket(const BYTE * buf, size_t len, WORD onid, WORD t
 		// このスロットは他の相対TS番号用スロットか未割当
 		return FALSE;
 
+	// ストリーム種別がTLVの場合はTLVパケットを出力する
+	// トランスポートエラーインジケーターが0, 固定値が0, 分割TLVのPIDであるときは正常な分割TLVパケットと判断
+	if (TSMFData.stream_info[ts_number - 1].stream_type == 0x0
+		&& (((buf[1] >> 5) & 0b101) == 0b000)
+		&& ((((buf[1] << 8) | buf[2]) & 0x1fff) == 0x2d)
+		) {
+		BYTE tlv_packet_start_indicator = (buf[1] >> 6) & 0x01;
+		if (tlv_packet_start_indicator == 0x0) {
+			*tlv_headersize = 3;
+			*tlv_start = 0;
+		}
+		else {
+			*tlv_headersize = 4;
+			*tlv_start = buf[3] + 4;
+		}
+		if (*tlv_start > PacketSize) {
+			return FALSE;
+		}
+	}
 	return TRUE;
 }
 
